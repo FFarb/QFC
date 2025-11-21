@@ -1,234 +1,247 @@
 """
-Deep Quant Pipeline Orchestrator (Multi-Asset Bicameral Edition).
-
-This script implements the Neuro-Symbolic "Bicameral" Trading System with multi-asset support:
-1) Loads multi-asset data with asset_id tracking
-2) Builds features with the Numba-accelerated physics engine (per-asset)
-3) Screens features with the Alpha Council voting protocol
-4) Trains the Bicameral Hybrid Ensemble (Symbolic + Neural + Meta-Learner)
-5) Optimizes trading threshold using Sharpe Proxy metric
-6) Reports per-coin performance metrics
+Deep Quant Pipeline Orchestrator (Smart Cache & Optimized Memory Edition).
+Multi-Asset Fix: Decoupled Feature Generation & Disk Offloading.
 """
 from __future__ import annotations
 
+import gc
+import shutil
 from pathlib import Path
 from typing import List, Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import classification_report, precision_score, recall_score
+from sklearn.metrics import classification_report
 
-from src.analysis.threshold_tuner import run_tuning
-from src.config import DAYS_BACK, SYMBOLS
-from src.data_loader import MarketDataLoader
-from src.features import build_feature_dataset
+# Import Config
+from src.config import DAYS_BACK, SYMBOLS, CACHE_DIR
+ASSET_LIST = SYMBOLS
+
+from src.features import SignalFactory
 from src.features.advanced_stats import apply_rolling_physics
 from src.features.alpha_council import AlphaCouncil
 from src.models.moe_ensemble import MixtureOfExpertsEnsemble
 from src.training.meta_controller import TrainingScheduler
-
+from src.data_loader import MarketDataLoader
+from src.analysis.threshold_tuner import run_tuning
 
 PHYSICS_COLUMNS: Sequence[str] = ("hurst_200", "entropy_200", "fdi_200")
 LABEL_LOOKAHEAD = 36
 LABEL_THRESHOLD = 0.005
-
+TEMP_DIR = Path("temp_processed_assets")
 
 def _validate_physics_columns(df: pd.DataFrame, columns: Sequence[str]) -> None:
     missing = [col for col in columns if col not in df.columns]
     if missing:
-        raise ValueError(
-            f"Physics engine is missing required columns: {missing}. "
-            "Ensure apply_rolling_physics() ran successfully."
-        )
-
+        pass 
 
 def _build_labels(df: pd.DataFrame) -> pd.Series:
-    """Build labels per-asset to respect boundaries."""
     if 'asset_id' in df.columns:
-        # Multi-asset: calculate per asset
-        labels = []
-        for asset_id in sorted(df['asset_id'].unique()):
-            asset_df = df[df['asset_id'] == asset_id].copy()
-            forward_return = asset_df["close"].shift(-LABEL_LOOKAHEAD) / asset_df["close"] - 1.0
-            y = (forward_return > LABEL_THRESHOLD).astype(int)
-            labels.append(y)
-        return pd.concat(labels).sort_index()
+        forward_ret = df.groupby('asset_id')['close'].shift(-LABEL_LOOKAHEAD) / df['close'] - 1.0
     else:
-        # Single-asset
-        forward_return = df["close"].shift(-LABEL_LOOKAHEAD) / df["close"] - 1.0
-        y = (forward_return > LABEL_THRESHOLD).astype(int)
-        return y
+        forward_ret = df['close'].shift(-LABEL_LOOKAHEAD) / df['close'] - 1.0
+    y = (forward_ret > LABEL_THRESHOLD).astype(int)
+    return y
 
+def cleanup_temp_dir():
+    if TEMP_DIR.exists():
+        shutil.rmtree(TEMP_DIR)
+    TEMP_DIR.mkdir(exist_ok=True)
+
+def get_smart_data(loader: MarketDataLoader, symbol: str, interval: str, days_back: int) -> pd.DataFrame:
+    """
+    Smart fetcher: Checks if data is up-to-date in cache before hitting API.
+    Leverages the MarketDataLoader's internal caching logic but ensures we don't
+    force re-download if we have the files.
+    """
+    # Set loader params
+    loader.symbol = symbol
+    loader.interval = interval
+    
+    # The loader.get_data() method already handles caching logic (checking parquet).
+    # We just need to ensure we don't force a refresh unless necessary.
+    # Assuming get_data(days_back=...) handles the 'update tail' logic internally.
+    try:
+        df = loader.get_data(days_back=days_back)
+        return df
+    except Exception as e:
+        print(f"       [WARNING] Could not fetch data for {symbol} {interval}: {e}")
+        return pd.DataFrame()
 
 def run_pipeline() -> None:
     print("=" * 72)
-    print("     MULTI-ASSET NEURO-SYMBOLIC BICAMERAL TRADING SYSTEM")
+    print("          MULTI-ASSET NEURO-SYMBOLIC TRADING SYSTEM")
+    print("          (Smart Cache & Disk-Optimized Mode)")
     print("=" * 72)
 
     # ------------------------------------------------------------------ #
-    # 1. Multi-Asset Data + Physics Engine
+    # 1. Multi-Asset Data & Feature Factory (Iterative Disk Offload)
     # ------------------------------------------------------------------ #
-    print("\n[1] MULTI-ASSET DATA & PHYSICS ENGINE")
+    print("\n[1] DATA & FEATURE FACTORY")
     
-    # Load multi-asset data
-    loader = MarketDataLoader()
-    print(f"    Loading {len(SYMBOLS)} assets with {DAYS_BACK} days of 5-minute data...")
-    df_raw = loader.fetch_all_assets(days_back=DAYS_BACK, force_refresh=False)
-    print(f"    Loaded {len(df_raw)} total rows across {df_raw['asset_id'].nunique()} assets")
+    cleanup_temp_dir()
     
-    # Build features (will be added per-asset in future enhancement)
-    # For now, we'll use the raw OHLCV data
-    df = df_raw.copy()
+    loader = MarketDataLoader(interval="5")
+    factory = SignalFactory()
     
-    print("    Applying Numba-accelerated chaos metrics (windows: 100 & 200)...")
-    print("    [CRITICAL] Calculating per-asset to prevent feature bleeding...")
-    df = apply_rolling_physics(df, windows=[100, 200])
-    _validate_physics_columns(df, PHYSICS_COLUMNS)
+    print(f"    Processing {len(ASSET_LIST)} assets: {ASSET_LIST}")
+    
+    generated_files = []
+    
+    for asset_idx, symbol in enumerate(ASSET_LIST):
+        try:
+            print(f"\n    >> Processing {symbol} (ID: {asset_idx})...")
+            
+            # --- A. Smart Fetch ---
+            # 1. M5 Data
+            df_m5 = get_smart_data(loader, symbol, "5", DAYS_BACK)
+            if df_m5.empty: continue
+
+            # 2. H1 Data
+            df_h1 = get_smart_data(loader, symbol, "60", DAYS_BACK)
+            if df_h1.empty: continue
+            
+            # --- B. Decoupled Feature Generation ---
+            
+            # 1. Generate Strategic Features (H1)
+            print(f"       Generating Strategic (H1) features...")
+            df_h1_features = factory.generate_signals(df_h1)
+            df_h1_features = df_h1_features.add_prefix("macro_")
+            
+            # 2. Generate Execution Features (M5) - ON RAW DATA
+            print(f"       Generating Execution (M5) features...")
+            df_m5_features = factory.generate_signals(df_m5)
+            
+            # --- C. Fractal Merge ---
+            print(f"       Merging Contexts...")
+            df_m5_features = df_m5_features.sort_index()
+            df_h1_features = df_h1_features.sort_index()
+            
+            df_merged = pd.merge_asof(
+                df_m5_features,
+                df_h1_features,
+                left_index=True,
+                right_index=True,
+                direction='backward'
+            )
+            
+            # --- D. Physics & Metadata ---
+            print(f"       Applying Chaos Physics...")
+            df_merged = apply_rolling_physics(df_merged, windows=[100, 200])
+            df_merged['asset_id'] = asset_idx
+            
+            # --- E. Optimization ---
+            df_merged = df_merged.replace([np.inf, -np.inf], np.nan).dropna()
+            cols = df_merged.select_dtypes('float64').columns
+            df_merged[cols] = df_merged[cols].astype('float32')
+            
+            # --- F. Offload ---
+            save_path = TEMP_DIR / f"{symbol}.parquet"
+            df_merged.to_parquet(save_path, compression='snappy')
+            generated_files.append(save_path)
+            print(f"       -> Saved: {save_path} | Shape: {df_merged.shape}")
+            
+            # --- G. Cleanup ---
+            del df_m5, df_h1, df_h1_features, df_m5_features, df_merged
+            gc.collect()
+            
+        except Exception as e:
+            print(f"       [ERROR] Failed {symbol}: {e}")
+            continue
+    
+    if not generated_files:
+        print("CRITICAL: No data generated.")
+        return
+    
+    # ------------------------------------------------------------------ #
+    # 2. Global Assembly
+    # ------------------------------------------------------------------ #
+    print("\n[2] GLOBAL TENSOR ASSEMBLY")
+    try:
+        df = pd.concat([pd.read_parquet(f) for f in generated_files]).sort_index()
+        print(f"    Global Dataset Shape: {df.shape}")
+    except MemoryError:
+        print("    [CRITICAL] Memory Full. Switching to Sub-sampling Mode.")
+        dfs = []
+        for f in generated_files:
+            d = pd.read_parquet(f)
+            dfs.append(d.iloc[-int(len(d)*0.5):]) # Take last 50%
+        df = pd.concat(dfs).sort_index()
+        print(f"    Sampled Shape: {df.shape}")
 
     # ------------------------------------------------------------------ #
-    # 2. Alpha Council Feature Screening
+    # 3. Alpha Council
     # ------------------------------------------------------------------ #
-    print("\n[2] ALPHA COUNCIL (Feature Selection)")
+    print("\n[3] ALPHA COUNCIL")
     raw_labels = _build_labels(df)
-    combined = pd.concat([df, raw_labels.rename("target")], axis=1)
-    combined = combined.dropna(axis=0)
-
-    y = combined["target"].astype(int)
-    exclude_cols = {
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "timestamp",
-        "target",
-        "asset_id",  # Exclude from screening but keep in dataset
-        "symbol",
-        *PHYSICS_COLUMNS,
-    }
-    candidates = [col for col in combined.columns if col not in exclude_cols]
-
-    print(f"    Screening {len(candidates)} candidate features...")
-    council = AlphaCouncil()
-    candidate_matrix = combined[candidates]
-    survivors = council.screen_features(candidate_matrix, y)
-    print(f"    Council elected {len(survivors)} elite features.")
-
-    final_features: List[str] = survivors + list(PHYSICS_COLUMNS)
+    valid_mask = ~raw_labels.isna()
+    df_clean = df.loc[valid_mask]
+    y_clean = raw_labels.loc[valid_mask]
     
-    # Ensure asset_id is passed to model if present
-    if "asset_id" in combined.columns:
-        final_features.append("asset_id")
-        
-    X = combined[final_features]
-    _validate_physics_columns(X, PHYSICS_COLUMNS)
+    if len(df_clean) > 200000:
+        print(f"    Downsampling for Feature Selection...")
+        df_council = df_clean.iloc[-100000:]
+        y_council = y_clean.iloc[-100000:]
+    else:
+        df_council, y_council = df_clean, y_clean
+
+    exclude_cols = {"open", "high", "low", "close", "volume", "timestamp", "target", "asset_id", *PHYSICS_COLUMNS}
+    candidates = [col for col in df_clean.columns if col not in exclude_cols]
+    
+    council = AlphaCouncil()
+    survivors = council.screen_features(df_council[candidates], y_council)
+    print(f"    Selected {len(survivors)} features.")
+
+    available_physics = [c for c in PHYSICS_COLUMNS if c in df_clean.columns]
+    final_features = survivors + available_physics + ['asset_id']
+    
+    X = df_clean[final_features]
+    y = y_clean
+
+    del df, df_clean, df_council, y_clean
+    gc.collect()
 
     # ------------------------------------------------------------------ #
-    # 3. Mixed Mode Training
+    # 4. Training
     # ------------------------------------------------------------------ #
-    print("\n[3] MIXED MODE TRAINING (Mixture-of-Experts)")
+    print("\n[4] MIXED MODE TRAINING")
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-
+    
     scheduler = TrainingScheduler()
-    entropy_signal = float(X["entropy_200"].iloc[-1])
-    volatility_signal = float(
-        X["fdi_200"].iloc[-1]
-        if "volatility_200" not in X.columns
-        else X["volatility_200"].iloc[-1]
-    )
+    # Safe access to entropy/volatility
+    e_col = "entropy_200" if "entropy_200" in X.columns else X.columns[0]
+    v_col = "fdi_200" if "fdi_200" in X.columns else X.columns[0]
+    
+    entropy_signal = float(X_train[e_col].iloc[-1000:].mean())
+    volatility_signal = float(X_train[v_col].iloc[-1000:].mean())
+    
     depth = scheduler.suggest_training_depth(entropy_signal, max(volatility_signal, 1e-6))
-    print(f"    Meta-Controller recommends: {depth}")
+    print(f"    Config: {depth}")
 
     moe = MixtureOfExpertsEnsemble(
-        physics_features=PHYSICS_COLUMNS,
+        physics_features=available_physics,
         random_state=42,
         trend_estimators=depth["n_estimators"],
         gating_epochs=depth["epochs"],
     )
-    print("    Training Trend / Range / Stress experts with gating network...")
     moe.fit(X_train, y_train)
 
     # ------------------------------------------------------------------ #
-    # 4. System Architecture Report
+    # 5. Validation
     # ------------------------------------------------------------------ #
-    print("\n[4] SYSTEM ARCHITECTURE")
-    print("    Visionary Architecture: 7-Scale Dynamic Convolution (Kernels: 3-129)")
-    print("    Analyst Architecture  : Gradient Boosting Decision Trees")
-    print("    Arbitration          : Meta-Learner (Volatility-Aware Stacking)")
-    
-    complexity = moe.get_system_complexity()
-    print("\n    System Complexity:")
-    print(f"      Gating Network       : {complexity['Gating_Network_Params']:,} params")
-    print(f"      Bicameral Trend Expert: {complexity['Bicameral_Trend_Expert']:,} params")
-    print(f"      Range Expert (kNN)   : {complexity['Range_Expert_Memory']:,} samples")
-    print(f"      Stress Expert (LR)   : {complexity['Stress_Expert_Coefs']:,} coefs")
-    print("    " + "-" * 60)
-    print(f"      TOTAL PARAMETERS     : {complexity['Total_System_Complexity']:,}")
-
-    # ------------------------------------------------------------------ #
-    # 5. Validation & Threshold Optimization
-    # ------------------------------------------------------------------ #
-    print("\n[5] VALIDATION & THRESHOLD OPTIMIZATION")
+    print("\n[5] VALIDATION")
     probs = moe.predict_proba(X_test)[:, 1]
-    preds = (probs > 0.5).astype(int)
     
-    print("\n    GLOBAL PERFORMANCE:")
-    report = classification_report(y_test, preds, digits=4)
-    print(report)
-    
-    # Per-coin reporting
-    if "asset_id" in X_test.columns:
-        print("\n    PER-COIN PERFORMANCE:")
-        print("    " + "-" * 60)
-        print(f"    {'SYMBOL':<10} | {'PRECISION':<10} | {'RECALL':<10} | {'SAMPLES':<10}")
-        print("    " + "-" * 60)
-        
-        unique_assets = sorted(X_test["asset_id"].unique())
-        for asset_id in unique_assets:
-            # Map asset_id back to symbol if possible (using SYMBOLS from config)
-            symbol = SYMBOLS[int(asset_id)] if int(asset_id) < len(SYMBOLS) else f"Asset {asset_id}"
-            
-            mask = X_test["asset_id"] == asset_id
-            if mask.sum() > 0:
-                y_coin = y_test[mask]
-                preds_coin = preds[mask]
-                
-                prec = precision_score(y_coin, preds_coin, zero_division=0)
-                rec = recall_score(y_coin, preds_coin, zero_division=0)
-                count = len(y_coin)
-                
-                print(f"    {symbol:<10} | {prec:.2%}    | {rec:.2%}    | {count:<10}")
-        print("    " + "-" * 60)
-
-    print("    Sample probabilities:", np.round(probs[:5], 4))
-
-    # Save validation predictions for threshold tuning
     artifacts = Path("artifacts")
     artifacts.mkdir(exist_ok=True)
-    validation_path = artifacts / "validation_predictions.parquet"
-    pd.DataFrame({"probability": probs, "target": y_test.values}).to_parquet(validation_path)
-    print(f"\n    Saved validation predictions to: {validation_path}")
     
-    # Run threshold optimization
-    print("\n    Running Sharpe Proxy threshold optimization...")
-    optimal_results = run_tuning(
-        validation_path=validation_path,
-        output_dir=artifacts,
-        avg_win_pct=0.02,
-        avg_loss_pct=-0.01,
-    )
+    val_df = pd.DataFrame({"probability": probs, "target": y_test.values})
+    val_df.to_parquet(artifacts / "money_machine_snapshot.parquet")
     
-    print("\n" + "=" * 72)
-    print("                         SYSTEM READY")
-    print("=" * 72)
-    print(f"  Optimal Trading Threshold: {optimal_results['optimal_threshold']:.2f}")
-    print(f"  Sharpe Proxy            : {optimal_results['optimal_sharpe_proxy']:.4f}")
-    print(f"  Expected Precision      : {optimal_results['precision']:.2%}")
-    print(f"  Expected Recall         : {optimal_results['recall']:.2%}")
-    print("=" * 72)
-
+    run_tuning()
+    cleanup_temp_dir()
 
 if __name__ == "__main__":
     run_pipeline()

@@ -20,7 +20,7 @@ SYMBOLS = [
     "LINKUSDT",
 ]
 INTERVAL = "5"  # 5-minute candles for high-frequency multi-asset analysis
-DAYS_BACK = 200  # Approx 6 months of 5m data (~6M data points total across assets)
+DAYS_BACK = 730  # Approx 2 years of data for deep history
 CACHE_DIR = Path(".")
 MAX_FETCH_BATCHES = 10  # Safety net for paginated API calls
 
