@@ -1,0 +1,273 @@
+"""
+Data loading utilities for Bybit futures data with caching and visualization helpers.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+import webbrowser
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from pybit.unified_trading import HTTP
+
+from .config import (
+    CACHE_DIR,
+    DAYS_BACK,
+    INTERVAL,
+    MAX_FETCH_BATCHES,
+    PLOT_TEMPLATE,
+    SYMBOL,
+)
+
+
+class MarketDataLoader:
+    """
+    Smart Bybit data loader that combines cached parquet storage with incremental API fetches.
+    """
+
+    def __init__(
+        self,
+        symbol: str = SYMBOL,
+        interval: str = INTERVAL,
+        cache_dir: Path | str = CACHE_DIR,
+        max_batches: int = MAX_FETCH_BATCHES,
+        session: Optional[HTTP] = None,
+    ) -> None:
+        self.symbol = symbol
+        self.interval = interval
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_file = self.cache_dir / f"{symbol.lower()}_{interval}m_cache.parquet"
+        self.session = session or HTTP(testnet=False)
+        self.max_batches = max_batches
+
+    def get_data(
+        self,
+        days_back: int = DAYS_BACK,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        force_refresh: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Return OHLCV data for the requested window using local caches when possible.
+        """
+        end_time = end_time or datetime.utcnow()
+        start_time = start_time or (end_time - timedelta(days=days_back))
+
+        print(f"\n[DATA] Fetching {self.symbol} @ {self.interval}m")
+        print(f"       Window: {start_time} -> {end_time}")
+
+        if force_refresh or not self.cache_file.exists():
+            print("       Cache miss or forced refresh -> fetching full range...")
+            fresh = self._fetch_data(int(start_time.timestamp() * 1000), int(end_time.timestamp() * 1000))
+            self._write_cache(fresh)
+            return self._filter_range(fresh, start_time, end_time)
+
+        cached_df = self._load_cache()
+        cache_start = cached_df.index[0].to_pydatetime()
+        cache_end = cached_df.index[-1].to_pydatetime()
+
+        print(f"       Cache range: {cache_start} -> {cache_end}")
+
+        frames = [cached_df]
+        cache_updated = False
+
+        if start_time < cache_start:
+            print(f"       Cache missing head data before {cache_start}, fetching...")
+            head = self._fetch_data(int(start_time.timestamp() * 1000), int(cache_start.timestamp() * 1000))
+            if not head.empty:
+                frames.append(head)
+                cache_updated = True
+
+        if end_time > cache_end:
+            print(f"       Fetching incremental tail data since {cache_end}...")
+            tail = self._fetch_data(int(cache_end.timestamp() * 1000), int(end_time.timestamp() * 1000))
+            if not tail.empty:
+                frames.append(tail)
+                cache_updated = True
+
+        combined = pd.concat(frames).sort_index()
+        combined = combined[~combined.index.duplicated(keep="first")]
+
+        if cache_updated:
+            self._write_cache(combined)
+            print(f"       Cache updated ({len(combined)} total rows).")
+
+        return self._filter_range(combined, start_time, end_time)
+
+    def save_to_parquet(self, df: pd.DataFrame, path: Path | str) -> None:
+        """Persist OHLCV data to a parquet file."""
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.sort_index().to_parquet(out_path)
+        print(f"[DATA] Saved {len(df)} rows to {out_path}")
+
+    def clear_cache(self) -> None:
+        """Delete the cached parquet file, if it exists."""
+        if self.cache_file.exists():
+            self.cache_file.unlink()
+            print(f"[DATA] Cache cleared: {self.cache_file.name}")
+        else:
+            print("[DATA] No cache file found to delete.")
+
+    def fetch_history(self, start_date: datetime, end_date: datetime) -> pd.DataFrame:
+        """Public wrapper around the internal fetcher."""
+        return self._fetch_data(int(start_date.timestamp() * 1000), int(end_date.timestamp() * 1000))
+
+    def _load_cache(self) -> pd.DataFrame:
+        df = pd.read_parquet(self.cache_file)
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df = df.set_index("timestamp")
+        else:
+            df.index = pd.to_datetime(df.index)
+        return df.sort_index()
+
+    def _write_cache(self, df: pd.DataFrame) -> None:
+        df.sort_index().to_parquet(self.cache_file)
+
+    def _filter_range(self, df: pd.DataFrame, start_time: datetime, end_time: datetime) -> pd.DataFrame:
+        mask = (df.index >= start_time) & (df.index <= end_time)
+        filtered = df.loc[mask].copy()
+        filtered = filtered[~filtered.index.duplicated(keep="first")]
+        print(f"       Prepared {len(filtered)} candles.")
+        return filtered
+
+    def _fetch_data(self, start_ms: int, end_ms: int) -> pd.DataFrame:
+        print("       Fetching from Bybit in paginated batches...")
+        all_data: list[list[str | float]] = []
+        current_end = end_ms
+        batch = 0
+
+        while current_end > start_ms and batch < self.max_batches:
+            try:
+                response = self.session.get_kline(
+                    category="linear",
+                    symbol=self.symbol,
+                    interval=self.interval,
+                    end=current_end,
+                    limit=1000,
+                )
+            except Exception as exc:
+                print(f"       [ERROR] Fetch error: {exc}")
+                break
+
+            if response["retCode"] != 0:
+                print(f"       [ERROR] API Error: {response['retMsg']}")
+                break
+
+            klines = response["result"]["list"]
+            if not klines:
+                break
+
+            for entry in klines:
+                candle_ts = int(entry[0])
+                if start_ms <= candle_ts <= end_ms:
+                    all_data.append(entry)
+
+            batch += 1
+            print(f"         Batch {batch}: collected {len(all_data)} candles total.")
+            oldest_ts = int(klines[-1][0]) - 1
+            if oldest_ts <= start_ms:
+                break
+            current_end = oldest_ts
+            time.sleep(0.1)
+
+        df = pd.DataFrame(all_data, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
+        if df.empty:
+            return df
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"].astype(float), unit="ms")
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = df[col].astype(float)
+
+        df = df.drop(columns=["turnover"])
+        df = df.sort_values("timestamp").set_index("timestamp")
+        return df
+
+
+def visualize_data(df: pd.DataFrame, symbol: str = SYMBOL) -> Path:
+    """
+    Create an interactive candlestick + volume chart and open it in a browser.
+    """
+    working_df = df.copy()
+    if "timestamp" not in working_df.columns:
+        working_df = working_df.reset_index()
+
+    working_df["SMA_20"] = working_df["close"].rolling(window=20).mean()
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=[0.7, 0.3],
+        subplot_titles=(f"{symbol} Price Chart", "Volume"),
+    )
+
+    fig.add_trace(
+        go.Candlestick(
+            x=working_df["timestamp"],
+            open=working_df["open"],
+            high=working_df["high"],
+            low=working_df["low"],
+            close=working_df["close"],
+            name="OHLC",
+            increasing_line_color="#26a69a",
+            decreasing_line_color="#ef5350",
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=working_df["timestamp"],
+            y=working_df["SMA_20"],
+            mode="lines",
+            name="SMA 20",
+            line=dict(color="#FFA726", width=2),
+        ),
+        row=1,
+        col=1,
+    )
+
+    colors = ["#ef5350" if close < open_ else "#26a69a" for close, open_ in zip(working_df["close"], working_df["open"])]
+    fig.add_trace(
+        go.Bar(
+            x=working_df["timestamp"],
+            y=working_df["volume"],
+            name="Volume",
+            marker_color=colors,
+            showlegend=False,
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig.update_layout(
+        title=f"{symbol} Futures - Interactive Chart",
+        yaxis_title="Price (USDT)",
+        yaxis2_title="Volume",
+        xaxis_rangeslider_visible=False,
+        template=PLOT_TEMPLATE,
+        height=800,
+        hovermode="x unified",
+    )
+
+    fig.update_xaxes(title_text="Date", row=2, col=1)
+
+    filename = Path(f"chart_{symbol}.html")
+    fig.write_html(filename)
+    print(f"[PLOT] Chart saved to {filename}")
+
+    filepath = Path(os.path.abspath(filename))
+    webbrowser.open(f"file://{filepath}")
+    print("[PLOT] Opening chart in browser...")
+    return filepath
