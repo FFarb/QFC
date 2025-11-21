@@ -29,6 +29,8 @@ TRAINING_SET = Path("btc_sniper_ready.parquet")
 TOP_FEATURES = 25
 TRAIN_SPLIT = 0.8
 RANDOM_SEED = 42
+META_PROB_THRESHOLD = 0.65
+PRIMARY_RECALL_TARGET = 0.7
 
 # --- Visualization -----------------------------------------------------------
 PLOT_TEMPLATE = "plotly_dark"

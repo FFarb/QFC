@@ -1,10 +1,10 @@
 """
 Deep Quant Pipeline Orchestrator.
-Executes the Multi-Stage Deep Quant Pipeline:
+Executes the "Zero-Heuristic" End-to-End ML System:
 1. Feature Engineering (Physics/Chaos)
-2. Chaos Filtering (FDI)
-3. Regime-Based Training (Trend vs MeanRev)
-4. Walk-Forward Simulation with MAE Analysis
+2. Universal Model Training (No Filters, No Regime Split)
+3. Walk-Forward Simulation with Continuous Sizing (Kelly-like)
+4. Validation (Hurst vs FDI Scatter)
 """
 
 import pandas as pd
@@ -16,11 +16,11 @@ from typing import Dict, List
 
 from src.config import (
     SYMBOL, INTERVAL, DAYS_BACK, FEATURE_STORE, 
-    TP_PCT, SL_PCT, BARRIER_HORIZON
+    TP_PCT, SL_PCT, BARRIER_HORIZON, LEVERAGE
 )
 from src.features import build_feature_dataset
 from src.models import SniperModelTrainer
-from src.metrics import check_mae_mfe, profit_weighted_confusion_matrix
+from src.metrics import check_mae_mfe
 
 def run_pipeline():
     # --- 1. Data & Features ---
@@ -32,69 +32,35 @@ def run_pipeline():
     if not all(col in df.columns for col in required_cols):
         raise ValueError(f"Missing required physics features: {required_cols}")
 
-    # --- 2. Chaos Filter ---
-    print("\n=== STEP 2: Chaos Filter (FDI) ===")
-    initial_len = len(df)
-    # Filter out high chaos (FDI > 1.6)
-    # Note: We only filter for TRAINING. For simulation, we apply the filter dynamically.
-    # Actually, the user said "Drop all rows where FDI > 1.6" as Step A.
-    # Let's assume this applies to the dataset used for training/analysis.
+    # --- 2. Universal Model Training (No Filtering) ---
+    print("\n=== STEP 2: Universal Model Training ===")
     
-    # We need to split Train/Test chronologically FIRST to avoid lookahead bias.
+    # Split Train/Test chronologically
+    initial_len = len(df)
     train_split_idx = int(initial_len * 0.8)
     train_df = df.iloc[:train_split_idx].copy()
     test_df = df.iloc[train_split_idx:].copy()
     
     print(f"Train Set: {len(train_df)} | Test Set: {len(test_df)}")
     
-    # Apply Chaos Filter to Training Data
-    train_filtered = train_df[train_df["fdi_100"] <= 1.6].copy()
-    filtered_count = len(train_df) - len(train_filtered)
-    print(f"Filtered {filtered_count} chaotic rows ({filtered_count/len(train_df):.1%}) from Training Set.")
-    
-    # --- 3. Split Training (Hypothesis Injection) ---
-    print("\n=== STEP 3: Regime-Based Training ===")
-    
-    # Trend Regime: Hurst > 0.5
-    df_trend = train_filtered[train_filtered["hurst_100"] > 0.5].copy()
-    print(f"Training Trend Model on {len(df_trend)} samples (Hurst > 0.5)")
-    
+    # Train Universal Model
     trainer = SniperModelTrainer()
-    trend_result = trainer.run(
-        input_df=df_trend, 
-        model_name="Trend_Model",
-        output_path="data/trend_model_data.parquet"
+    result = trainer.run(
+        input_df=train_df, 
+        model_name="Universal_Model",
+        output_path="data/universal_model_data.parquet"
     )
-    trend_model = trend_result["model"]
+    model = result["model"]
+    top_features = result["top_features"]
     
-    # Mean Reversion Regime: Hurst <= 0.5
-    df_mean_rev = train_filtered[train_filtered["hurst_100"] <= 0.5].copy()
-    print(f"Training MeanRev Model on {len(df_mean_rev)} samples (Hurst <= 0.5)")
+    print(f"Top Features Selected: {top_features}")
     
-    mean_rev_result = trainer.run(
-        input_df=df_mean_rev, 
-        model_name="MeanRev_Model",
-        output_path="data/meanrev_model_data.parquet"
-    )
-    mean_rev_model = mean_rev_result["model"]
-    
-    # --- 4. Walk-Forward Simulation ---
-    print("\n=== STEP 4: Walk-Forward Simulation (Test Set) ===")
+    # --- 3. Walk-Forward Simulation (Continuous Sizing) ---
+    print("\n=== STEP 3: Walk-Forward Simulation (Test Set) ===")
     
     equity = [10000.0] # Start with $10k
     equity_curve = []
     trades = []
-    
-    # We need to iterate through the Test Set
-    # We need 'target' column for ground truth? 
-    # Actually, we should simulate properly using future prices.
-    # But 'target' in df is already a triple-barrier label.
-    # However, for MAE analysis, we need the raw OHLCV of the *future* bars.
-    # Since 'target' is pre-calculated, it doesn't give us MAE.
-    # We need to look ahead.
-    
-    # Let's use the raw prices in test_df.
-    # We need to be careful about indexing.
     
     closes = test_df["close"].values
     highs = test_df["high"].values
@@ -102,54 +68,58 @@ def run_pipeline():
     hursts = test_df["hurst_100"].values
     fdis = test_df["fdi_100"].values
     
-    # Get features for prediction
-    # We need the exact same feature columns used in training
-    feature_cols = trend_result["top_features"] # Assuming both models use similar top features?
-    # Wait, 'top_features' might differ between models!
-    # We should use the specific features for each model.
-    trend_features = trend_result["top_features"]
-    mean_rev_features = mean_rev_result["top_features"]
+    # Feature Matrix for Test
+    X_test = test_df[top_features]
     
-    # Pre-select feature matrices
-    X_test_trend = test_df[trend_features]
-    X_test_mean_rev = test_df[mean_rev_features]
-    
-    # Iterate
     n_test = len(test_df)
     horizon = BARRIER_HORIZON
     
     print(f"Simulating {n_test} bars...")
     
+    # Get probabilities for the entire test set in one go for efficiency
+    # (Or loop if we want to simulate strict step-by-step, but model is static here)
+    probs = model.predict_proba(X_test)[:, 1] # Probability of Class 1 (Win)
+    
     for i in range(n_test - horizon):
         current_equity = equity[-1]
+        prob_win = probs[i]
         
-        # 1. Chaos Filter
-        if fdis[i] > 1.6:
+        # AI Execution Logic: Continuous Sizing
+        # Confidence = Prob_Win - 0.5
+        # If Prob_Win < 0.52 -> Size = 0
+        
+        if prob_win < 0.52:
             equity_curve.append(current_equity)
             continue # No Trade
             
-        # 2. Regime Selection
-        hurst = hursts[i]
-        if hurst > 0.5:
-            model = trend_model
-            features = X_test_trend.iloc[i:i+1]
-            regime = "Trend"
-        else:
-            model = mean_rev_model
-            features = X_test_mean_rev.iloc[i:i+1]
-            regime = "MeanRev"
-            
-        # 3. Prediction
-        pred = model.predict(features)[0]
+        confidence = prob_win - 0.5
+        scale_factor = 1.0 # Base scale
+        # Position Size = Confidence * Scale_Factor * Leverage? 
+        # User said: "Position_Size = Confidence * Scale_Factor"
+        # Let's assume this is the % of equity to risk or allocate.
+        # Let's map it to a fraction of equity.
+        # E.g. Confidence 0.15 (Prob 0.65) -> Size 0.15 (15% of equity?)
+        # That seems aggressive but let's follow the logic.
+        # Let's cap it or use the user's LEVERAGE as a multiplier on top?
+        # "Use TradePolicy only for safety limits (Max Leverage)"
         
-        if pred == 0:
-            equity_curve.append(current_equity)
-            continue # No Trade
+        # Let's define Position Size as % of Equity.
+        # size_pct = confidence * 2.0 (Scaling up? 0.15 * 2 = 0.3 -> 30% allocation)
+        # Let's stick to: size_pct = confidence * 1.0 for now.
+        # But wait, if confidence is 0.02 (0.52), size is 2%.
+        
+        size_pct = confidence * 2.0 # Scaling factor to make it meaningful
+        
+        # Safety Limit
+        max_leverage = LEVERAGE
+        if size_pct > max_leverage:
+            size_pct = max_leverage
             
-        # 4. Trade Execution & MAE Check
+        # Calculate Position Value
+        position_value = current_equity * size_pct
+        
+        # Trade Execution
         entry_price = closes[i]
-        
-        # Look ahead 'horizon' bars
         future_highs = highs[i+1 : i+1+horizon]
         future_lows = lows[i+1 : i+1+horizon]
         
@@ -158,43 +128,35 @@ def run_pipeline():
             tp_pct=TP_PCT, sl_pct=SL_PCT
         )
         
-        # Dynamic Leverage / Liquidation Check
-        # If Leverage * MAE > 1 (100%), Liquidation.
-        # Let's assume Leverage = 3 (from config)
-        leverage = 3
-        if mae * leverage > 1.0:
-            # Liquidation!
-            pnl = -1.0 # Lose 100% of margin? Or whole account?
-            # Let's assume isolated margin per trade.
-            # But for equity curve, let's say we lose the SL amount or Liquidation amount.
-            # If liquidated, we lose the position size.
-            # Let's stick to the simple PnL logic for now but mark it.
-            trade_pnl_pct = -1.0 # Rekt
-            outcome = "LIQUIDATION"
-        elif is_win:
-            trade_pnl_pct = TP_PCT * leverage
+        # PnL Calculation
+        # We are Long.
+        # If Win: +TP_PCT * position_value
+        # If Loss: -SL_PCT * position_value
+        # (Simplified, ignoring fees/slippage for now)
+        
+        if is_win:
+            pnl = position_value * TP_PCT
             outcome = "WIN"
         else:
-            trade_pnl_pct = -SL_PCT * leverage
+            pnl = -position_value * SL_PCT
             outcome = "LOSS"
             
-        # Update Equity (Fixed fractional or fixed size? Let's use fixed size for simplicity or compounding)
-        # Compounding:
-        new_equity = current_equity * (1 + trade_pnl_pct)
+        new_equity = current_equity + pnl
         equity.append(new_equity)
         
         trades.append({
             "Index": i,
-            "Regime": regime,
-            "Hurst": hurst,
+            "Hurst": hursts[i],
             "FDI": fdis[i],
+            "Prob_Win": prob_win,
+            "Size_Pct": size_pct,
             "Outcome": outcome,
-            "PnL": trade_pnl_pct,
+            "PnL": pnl,
             "MAE": mae,
             "MFE": mfe
         })
         
-    # --- 5. Reporting ---
+    # --- 4. Validation & Reporting ---
     trades_df = pd.DataFrame(trades)
     if len(trades_df) > 0:
         print("\n=== Simulation Results ===")
@@ -202,36 +164,40 @@ def run_pipeline():
         print(f"Final Equity: ${equity[-1]:.2f} (Start: $10,000)")
         print(f"Win Rate: {len(trades_df[trades_df['Outcome']=='WIN']) / len(trades_df):.2%}")
         
-        # Profit-Weighted Matrix
-        # We can construct it from the trades_df
-        # But we need 'y_true' and 'y_pred' style.
-        # Here y_pred is always 1 (since we only record trades).
-        # So we just show the PnL distribution.
-        
-        print("\nProfit by Regime:")
-        print(trades_df.groupby("Regime")["PnL"].sum())
-        
-        # Plot Equity Curve vs Hurst
-        # We need to align equity curve with time.
-        # equity_curve has length of simulation steps (minus skipped ones? No, we appended for skips).
-        # Wait, we appended for skips.
-        
-        # Plot
+        # Plot Equity Curve
         fig = go.Figure()
         fig.add_trace(go.Scatter(y=equity_curve, mode='lines', name='Equity'))
-        fig.update_layout(title="Deep Quant Strategy Equity Curve", template="plotly_dark")
+        fig.update_layout(title="Zero-Heuristic Strategy Equity Curve", template="plotly_dark")
         fig.write_html("equity_curve.html")
         print("Saved equity_curve.html")
         
-        # Scatter of Trades (Hurst vs PnL)
+        # Scatter Plot: X=Hurst, Y=FDI, Color=Model_Probability
+        # We want to see the probability landscape, not just trades.
+        # So let's plot a sample of the Test Set (or all of it) with probabilities.
+        # We can use the 'probs' array and the test_df features.
+        
+        viz_df = pd.DataFrame({
+            "Hurst": hursts[:len(probs)],
+            "FDI": fdis[:len(probs)],
+            "Probability": probs
+        })
+        
+        # Downsample for plotting if too large
+        if len(viz_df) > 5000:
+            viz_df = viz_df.sample(5000)
+            
         fig2 = px.scatter(
-            trades_df, x="Hurst", y="PnL", color="Outcome", 
-            title="Trade Performance vs Hurst Exponent",
+            viz_df, x="Hurst", y="FDI", color="Probability",
+            title="Model Probability Landscape (Hurst vs FDI)",
+            color_continuous_scale="RdYlGn", # Red to Green
             template="plotly_dark"
         )
-        fig2.add_vline(x=0.5, line_dash="dash", annotation_text="Regime Boundary")
-        fig2.write_html("hurst_pnl_scatter.html")
-        print("Saved hurst_pnl_scatter.html")
+        # Add lines for "Chaos Corner" reference (High FDI, Low Hurst)
+        fig2.add_hline(y=1.5, line_dash="dash", annotation_text="High Chaos")
+        fig2.add_vline(x=0.5, line_dash="dash", annotation_text="Random Walk")
+        
+        fig2.write_html("physics_probability_map.html")
+        print("Saved physics_probability_map.html")
         
     else:
         print("No trades executed.")

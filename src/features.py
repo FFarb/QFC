@@ -53,6 +53,14 @@ class SignalFactory:
         df["upper_shadow_ratio"] = (upper_shadow / (body_size + 1e-9)).astype(np.float32)
         df["lower_shadow_ratio"] = (lower_shadow / (body_size + 1e-9)).astype(np.float32)
 
+        df["volatility"] = df["log_ret"].rolling(window=20).std().astype(np.float32)
+        hurst_vals = ta.hurst(df["close"], length=100)
+        if hurst_vals is not None:
+            if isinstance(hurst_vals, pd.DataFrame):
+                df["hurst"] = hurst_vals.iloc[:, 0].astype(np.float32)
+            else:
+                df["hurst"] = hurst_vals.astype(np.float32)
+
         print(f"  [STEP B] Parametric indicators for windows: {self.windows}")
         for window in self.windows:
             df[f"RSI_{window}"] = ta.rsi(df["close"], length=window).astype(np.float32)
@@ -273,3 +281,62 @@ def build_feature_dataset(
         print(f"[FEATURES] Saved {len(features)} rows to {out_path}")
 
     return features
+
+
+def add_signal_interactions(
+    df: pd.DataFrame,
+    primary_signal: pd.Series,
+    reference_df: Optional[pd.DataFrame] = None,
+    volatility_col: str = "volatility",
+    trend_col: str = "hurst",
+) -> pd.DataFrame:
+    """
+    Append interaction terms needed by the meta-model.
+    """
+    signal = primary_signal.reindex(df.index).fillna(0).astype(np.float32)
+    working = df.copy()
+
+    if volatility_col not in working.columns:
+        working[volatility_col] = _derive_volatility(working, reference_df).astype(np.float32)
+    else:
+        working[volatility_col] = working[volatility_col].astype(np.float32).fillna(0)
+
+    if trend_col not in working.columns:
+        working[trend_col] = _derive_hurst(working, reference_df).astype(np.float32)
+    else:
+        working[trend_col] = working[trend_col].astype(np.float32).fillna(0)
+
+    working["volatility_x_signal"] = (working[volatility_col] * signal).astype(np.float32)
+    working["trend_x_signal"] = (working[trend_col] * signal).astype(np.float32)
+
+    return working
+
+
+def _derive_volatility(features_df: pd.DataFrame, reference_df: Optional[pd.DataFrame]) -> pd.Series:
+    if "log_ret" in features_df.columns:
+        vol = features_df["log_ret"].rolling(window=20).std()
+        return vol.fillna(0)
+    if reference_df is not None and "close" in reference_df.columns:
+        log_ret = np.log(reference_df["close"] / reference_df["close"].shift(1))
+        vol = log_ret.rolling(window=20).std()
+        return vol.reindex(features_df.index).fillna(0)
+    return pd.Series(0.0, index=features_df.index)
+
+
+def _derive_hurst(features_df: pd.DataFrame, reference_df: Optional[pd.DataFrame]) -> pd.Series:
+    price_series = None
+    if reference_df is not None and "close" in reference_df.columns:
+        price_series = reference_df["close"]
+    elif "close" in features_df.columns:
+        price_series = features_df["close"]
+
+    if price_series is not None and hasattr(ta, "hurst"):
+        hurst_vals = ta.hurst(price_series, length=100)
+        if hurst_vals is not None:
+            if isinstance(hurst_vals, pd.DataFrame):
+                hurst_series = hurst_vals.iloc[:, 0]
+            else:
+                hurst_series = hurst_vals
+            return hurst_series.reindex(features_df.index).fillna(0)
+
+    return pd.Series(0.0, index=features_df.index)

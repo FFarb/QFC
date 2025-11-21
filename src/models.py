@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import plotly.express as px
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.feature_selection import VarianceThreshold, mutual_info_classif
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 
@@ -28,7 +28,11 @@ from .config import (
     TP_ATR_MULT,
     SL_ATR_MULT,
     VOLATILITY_LOOKBACK,
+    META_PROB_THRESHOLD,
+    PRIMARY_RECALL_TARGET,
 )
+from .meta_model import MetaModelTrainer
+from .metrics import profit_weighted_confusion_matrix
 
 
 def get_triple_barrier_labels(
@@ -153,12 +157,10 @@ def filter_correlated_features(X: pd.DataFrame, y: pd.Series, threshold: float =
     return X.drop(columns=list(to_drop), errors="ignore")
 
 
-from .metrics import profit_weighted_confusion_matrix
-
 @dataclass
 class SniperModelTrainer:
     """
-    End-to-end workflow for labeling and training the sniper Random Forest classifier.
+    End-to-end workflow for labeling and training the sniper HistGradientBoosting classifier.
     """
 
     tp_pct: float = TP_PCT
@@ -183,18 +185,10 @@ class SniperModelTrainer:
         """
         Execute the labeling, feature ranking, model training, and artifact saving workflow.
         """
-        if input_df is not None:
-            df = input_df.copy()
-            print(f"[LOAD] Using provided DataFrame with shape {df.shape}")
-        else:
-            df = self._load_features(feature_store)
-        df_labeled = self._label_dataset(df)
-
-        exclude_cols = ["open", "high", "low", "close", "volume", "turnover", "timestamp", "target", "regime"]
-        feature_cols = [col for col in df_labeled.columns if col not in exclude_cols]
-
-        X = df_labeled[feature_cols]
-        y = df_labeled["target"].astype(int)
+        df_labeled, X, y, feature_cols = self.prepare_training_frame(
+            feature_store=feature_store,
+            input_df=input_df,
+        )
 
         selector = VarianceThreshold(threshold=0)
         selector.fit(X)
@@ -209,8 +203,11 @@ class SniperModelTrainer:
         top_features = mi_series.head(self.top_features).index.tolist()
         print(f"[RANKING] Selected top {len(top_features)} features.")
 
-        metrics, model, importances = self._train_random_forest(X_corr[top_features], y, model_name)
-        self._save_feature_importance(top_features, importances, model_name)
+        metrics, model, importances = self._train_model(X_corr[top_features], y, model_name)
+        
+        # HistGradientBoostingClassifier does not have feature_importances_ attribute directly
+        # We use MI scores for the chart since we already calculated them.
+        self._save_feature_importance(top_features, mi_series[top_features].values, model_name)
 
         final_cols = ["open", "high", "low", "close", "volume"] + top_features + ["target"]
         result_df = df_labeled[final_cols]
@@ -226,6 +223,37 @@ class SniperModelTrainer:
             "feature_store": Path(feature_store),
             "training_set": out_path,
         }
+
+    def prepare_training_frame(
+        self,
+        feature_store: Path | str = FEATURE_STORE,
+        input_df: Optional[pd.DataFrame] = None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, List[str]]:
+        """
+        Load the feature store, apply labeling, and return (df, X, y, feature_cols).
+        """
+        if input_df is not None:
+            df = input_df.copy()
+            print(f"[LOAD] Using provided DataFrame with shape {df.shape}")
+        else:
+            df = self._load_features(feature_store)
+        df_labeled = self._label_dataset(df)
+
+        exclude_cols = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "turnover",
+            "timestamp",
+            "target",
+            "regime",
+        ]
+        feature_cols = [col for col in df_labeled.columns if col not in exclude_cols]
+        X = df_labeled[feature_cols]
+        y = df_labeled["target"].astype(int)
+        return df_labeled, X, y, feature_cols
 
     def _load_features(self, feature_store: Path | str) -> pd.DataFrame:
         path = Path(feature_store)
@@ -253,16 +281,99 @@ class SniperModelTrainer:
             print("[LABELS] Warning: only a handful of positive samples detected.")
         return df
 
-    def _train_random_forest(self, X: pd.DataFrame, y: pd.Series, model_name: str):
+    def train_primary_model(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        min_recall: float = PRIMARY_RECALL_TARGET,
+        class_weight: Optional[Dict[int, float]] = None,
+    ) -> Dict[str, object]:
+        """
+        Train a high-recall RandomForestClassifier to propose trade opportunities.
+        """
         split_idx = int(len(X) * self.train_split)
         X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
         y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
-        clf = RandomForestClassifier(
-            n_estimators=100,
+        rf = RandomForestClassifier(
+            n_estimators=500,
+            max_depth=None,
+            min_samples_leaf=4,
+            max_features="sqrt",
+            class_weight=class_weight or {0: 1.0, 1: 2.5},
+            random_state=self.random_state,
+            n_jobs=-1,
+        )
+        rf.fit(X_train, y_train)
+        y_pred = rf.predict(X_test)
+
+        metrics = {
+            "precision": precision_score(y_test, y_pred),
+            "recall": recall_score(y_test, y_pred),
+            "accuracy": accuracy_score(y_test, y_pred),
+        }
+        print(
+            f"[PRIMARY] Precision={metrics['precision']:.4f} "
+            f"Recall={metrics['recall']:.4f} Accuracy={metrics['accuracy']:.4f}"
+        )
+        if metrics["recall"] < min_recall:
+            print(
+                f"[PRIMARY] Warning: recall {metrics['recall']:.2f} below target "
+                f"{min_recall:.2f}. Consider retuning hyperparameters."
+            )
+
+        full_signals = pd.Series(rf.predict(X), index=X.index, name="primary_signal").astype(np.int8)
+        probabilities = pd.Series(rf.predict_proba(X)[:, 1], index=X.index, name="primary_probability").astype(
+            np.float32
+        )
+
+        return {
+            "model": rf,
+            "metrics": metrics,
+            "signals": full_signals,
+            "probabilities": probabilities,
+        }
+
+    def train_meta_model(
+        self,
+        X: pd.DataFrame,
+        primary_signal: pd.Series,
+        y: pd.Series,
+        probability_threshold: float = META_PROB_THRESHOLD,
+    ) -> Dict[str, object]:
+        """
+        Train the HistGradientBoosting meta model that filters primary signals.
+        """
+        meta_trainer = MetaModelTrainer(
+            probability_threshold=probability_threshold,
+            train_split=self.train_split,
+            random_state=self.random_state,
+        )
+        model, metrics, success_prob = meta_trainer.fit(X, primary_signal, y)
+        print(
+            f"[META] Precision={metrics['precision']:.4f} "
+            f"Recall={metrics['recall']:.4f} Accuracy={metrics['accuracy']:.4f}"
+        )
+
+        return {
+            "trainer": meta_trainer,
+            "model": model,
+            "metrics": metrics,
+            "train_probabilities": success_prob,
+        }
+
+    def _train_model(self, X: pd.DataFrame, y: pd.Series, model_name: str):
+        split_idx = int(len(X) * self.train_split)
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+        # Switch to HistGradientBoostingClassifier
+        clf = HistGradientBoostingClassifier(
+            max_iter=100,
             max_depth=4,
             random_state=self.random_state,
             class_weight="balanced",
+            early_stopping=True
         )
         clf.fit(X_train, y_train)
         y_pred = clf.predict(X_test)
@@ -275,11 +386,6 @@ class SniperModelTrainer:
         }
         print(f"[MODEL] Precision={metrics['precision']:.4f} Recall={metrics['recall']:.4f} Accuracy={metrics['accuracy']:.4f}")
         
-        # Calculate Profit-Weighted Confusion Matrix
-        # We don't have per-trade returns here easily unless we pass them through.
-        # For now, we use the theoretical TP/SL from config.
-        # Note: If using dynamic targets, this is an approximation using the average or base TP/SL.
-        # But let's use the class attributes.
         pnl_matrix = profit_weighted_confusion_matrix(
             y_test.values, 
             y_pred, 
@@ -291,7 +397,7 @@ class SniperModelTrainer:
         print(pnl_matrix)
         print(f"Total Theoretical PnL: {pnl_matrix.values.sum():.4f}\n")
 
-        return metrics, clf, clf.feature_importances_
+        return metrics, clf, None 
 
     def _save_feature_importance(self, features: List[str], importances: np.ndarray, model_name: str) -> None:
         feat_imp_df = pd.DataFrame({"Feature": features, "Importance": importances}).sort_values(
@@ -302,7 +408,7 @@ class SniperModelTrainer:
             x="Importance",
             y="Feature",
             orientation="h",
-            title=f"Top Features ({model_name})",
+            title=f"Top Features ({model_name}) - Mutual Information",
             color="Importance",
             color_continuous_scale="Viridis",
         )
