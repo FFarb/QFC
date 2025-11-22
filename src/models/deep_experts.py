@@ -1,15 +1,12 @@
 """
-Seven-Eye Visionary: Adaptive Deep Learning Expert for Topological Pattern Recognition.
+GraphVisionary: Global Market Attention Network.
 
-This module implements a multi-scale convolutional neural network that learns to
-identify market patterns across 7 different time horizons (3 hours to ~5 days).
-The attention mechanism dynamically weights each scale based on market conditions,
-learning to suppress macro-kernels during choppy markets and micro-kernels during
-strong trends.
+This module implements a neural network that processes the entire market as a single
+graph-like structure, allowing assets to attend to each other's liquidity flows.
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -19,270 +16,148 @@ from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.model_selection import train_test_split
 
 
-class AdaptiveConvExpert(nn.Module):
+class GraphVisionary(nn.Module):
     """
-    Seven-Eye Visionary: Multi-scale convolutional network with attention.
+    GraphVisionary: "Social" Neural Expert with Cross-Asset Attention.
     
     Architecture:
-    1. Latent Projection: Linear + BatchNorm1d + ReLU (tabular -> 3D manifold)
-    2. Multi-Scale Conv1d: 7 parallel branches with kernels [3, 5, 9, 17, 33, 65, 129]
-    3. Squeeze-and-Excitation: Attention mechanism to weight each scale
-    4. LSTM: Temporal integration of fused features
-    5. Head: Linear -> Sigmoid for binary classification
+    1. Local Encoder (Per-Asset): LSTM/Conv1d extracting temporal features.
+    2. Liquidity Router (Cross-Asset): Multi-Head Attention mixing asset embeddings.
+    3. Gating/Output: MLP projecting to probabilities.
     
-    Parameters
-    ----------
-    n_features : int
-        Number of input features (tabular data dimension).
-    hidden_dim : int, optional
-        Hidden dimension for latent projection (default: 32).
-    sequence_length : int, optional
-        Sequence length after reshaping (default: 16).
-    lstm_hidden : int, optional
-        LSTM hidden size (default: 64).
-    dropout : float, optional
-        Dropout probability (default: 0.2).
+    Input Shape: (Batch, Sequence_Length, N_Assets, N_Features)
+    Output Shape: (Batch, N_Assets, 1)
     """
     
     def __init__(
         self,
         n_features: int,
-        num_assets: int = 11,
-        embedding_dim: int = 16,
-        hidden_dim: int = 32,
-        sequence_length: int = 16,
-        lstm_hidden: int = 64,
+        n_assets: int,
+        hidden_dim: int = 64,
+        n_heads: int = 4,
         dropout: float = 0.2,
     ):
         super().__init__()
         self.n_features = n_features
-        self.num_assets = num_assets
-        self.embedding_dim = embedding_dim
+        self.n_assets = n_assets
         self.hidden_dim = hidden_dim
-        self.sequence_length = sequence_length
-        self.lstm_hidden = lstm_hidden
-        self.dropout_rate = dropout
         
-        # Asset Embedding: Learn coin-specific patterns
-        self.asset_embedding = nn.Embedding(num_assets, embedding_dim)
-        
-        # Latent Projection: (Batch, N_Features + Embedding_Dim) -> (Batch, Hidden_Dim * Seq_Len)
-        self.projection = nn.Sequential(
-            nn.Linear(n_features + embedding_dim, hidden_dim * sequence_length),
-            nn.BatchNorm1d(hidden_dim * sequence_length),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-        
-        # Multi-Scale Convolution: 7 parallel branches
-        # Kernels: [3, 5, 9, 17, 33, 65, 129] capture patterns from hours to days
-        self.kernel_sizes = [3, 5, 9, 17, 33, 65, 129]
-        self.conv_branches = nn.ModuleList([
-            nn.Conv1d(
-                in_channels=hidden_dim,
-                out_channels=hidden_dim,
-                kernel_size=k,
-                padding='same',  # Maintain time-alignment
-            )
-            for k in self.kernel_sizes
-        ])
-        
-        # Sparse Activation: Dropout after each conv layer
-        self.conv_dropout = nn.Dropout(dropout)
-        
-        # Squeeze-and-Excitation Attention: Learn to weight each scale
-        self.attention = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),  # Global pooling: (B, 7*H, S) -> (B, 7*H, 1)
-            nn.Flatten(),
-            nn.Linear(len(self.kernel_sizes) * hidden_dim, len(self.kernel_sizes)),
-            nn.ReLU(),
-            nn.Linear(len(self.kernel_sizes), len(self.kernel_sizes)),
-            nn.Softmax(dim=1),  # Weights sum to 1
-        )
-        
-        # LSTM: Temporal integration
-        self.lstm = nn.LSTM(
-            input_size=hidden_dim,
-            hidden_size=lstm_hidden,
+        # 1. Local Encoder: Processes each asset's time series independently
+        # Input: (Batch * N_Assets, Seq_Len, N_Features)
+        self.local_encoder = nn.LSTM(
+            input_size=n_features,
+            hidden_size=hidden_dim,
             num_layers=1,
             batch_first=True,
-            dropout=0.0,  # Single layer, no dropout
         )
         
-        # LSTM Dropout for sparse activation
-        self.lstm_dropout = nn.Dropout(dropout)
+        # 2. Liquidity Router: Cross-Asset Attention
+        # Input: (Batch, N_Assets, Hidden_Dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
         
-        # Classification Head
+        # 3. Output Head
         self.head = nn.Sequential(
-            nn.Linear(lstm_hidden, 1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid(),
         )
         
-    def forward(self, x: torch.Tensor, asset_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through the Seven-Eye Visionary.
+        Forward pass.
         
         Parameters
         ----------
         x : torch.Tensor
-            Input features of shape (Batch, N_Features).
-        asset_ids : torch.Tensor, optional
-            Asset IDs of shape (Batch,) for embedding lookup.
-            If None, uses zeros (default to first asset).
+            Input tensor of shape (Batch, Seq_Len, N_Assets, N_Features).
             
         Returns
         -------
         torch.Tensor
-            Predicted probabilities of shape (Batch, 1).
+            Predictions of shape (Batch, N_Assets, 1).
         """
-        batch_size = x.size(0)
+        batch_size, seq_len, n_assets, n_features = x.shape
         
-        # 0. Asset Embedding: Learn coin-specific features
-        if asset_ids is None:
-            asset_ids = torch.zeros(batch_size, dtype=torch.long, device=x.device)
-        asset_emb = self.asset_embedding(asset_ids)  # (B, Embedding_Dim)
+        # Flatten Batch and Assets for Local Encoder
+        # (B, S, N, F) -> (B * N, S, F)
+        x_flat = x.permute(0, 2, 1, 3).reshape(batch_size * n_assets, seq_len, n_features)
         
-        # Concatenate features with asset embedding
-        x_combined = torch.cat([x, asset_emb], dim=1)  # (B, N_Features + Embedding_Dim)
+        # Local Encoding
+        # lstm_out: (B*N, S, H), last_hidden: (1, B*N, H)
+        _, (last_hidden, _) = self.local_encoder(x_flat)
         
-        # 1. Latent Projection: (B, N_Features + Embedding_Dim) -> (B, Hidden * Seq)
-        projected = self.projection(x_combined)
+        # Reshape back to (B, N, H)
+        # last_hidden[0] is (B*N, H)
+        local_embeddings = last_hidden[0].view(batch_size, n_assets, self.hidden_dim)
         
-        # 2. Reshape to 3D: (B, Hidden * Seq) -> (B, Hidden, Seq)
-        reshaped = projected.view(batch_size, self.hidden_dim, self.sequence_length)
+        # Cross-Asset Attention (Liquidity Router)
+        # Q = K = V = local_embeddings
+        # attn_output: (B, N, H)
+        attn_output, _ = self.attention(
+            query=local_embeddings,
+            key=local_embeddings,
+            value=local_embeddings,
+        )
         
-        # 3. Multi-Scale Convolution: Apply 7 parallel branches with sparse activation
-        conv_outputs = []
-        for conv_branch in self.conv_branches:
-            conv_out = F.relu(conv_branch(reshaped))  # (B, Hidden, Seq)
-            conv_out = self.conv_dropout(conv_out)  # Sparse activation
-            conv_outputs.append(conv_out)
+        # Residual Connection + Norm (Optional but good practice, keeping simple for now as per spec)
+        # Mixing local and global context
+        mixed_embeddings = local_embeddings + attn_output
         
-        # 4. Stack outputs: (B, 7*Hidden, Seq)
-        stacked = torch.cat(conv_outputs, dim=1)
-        
-        # 5. Attention Aggregation: Learn weights for each scale
-        attention_weights = self.attention(stacked)  # (B, 7)
-        
-        # 6. Weighted Fusion: Sum weighted conv outputs
-        fused = torch.zeros_like(conv_outputs[0])  # (B, Hidden, Seq)
-        for idx, conv_out in enumerate(conv_outputs):
-            weight = attention_weights[:, idx:idx+1, None]  # (B, 1, 1)
-            fused += weight * conv_out
-        
-        # 7. LSTM: Temporal integration with sparse activation
-        # Transpose for LSTM: (B, Hidden, Seq) -> (B, Seq, Hidden)
-        lstm_input = fused.transpose(1, 2)
-        lstm_out, _ = self.lstm(lstm_input)  # (B, Seq, LSTM_Hidden)
-        lstm_out = self.lstm_dropout(lstm_out)  # Sparse activation
-        
-        # 8. Take last timestep
-        last_hidden = lstm_out[:, -1, :]  # (B, LSTM_Hidden)
-        
-        # 9. Classification Head
-        output = self.head(last_hidden)  # (B, 1)
+        # Output Head
+        # (B, N, H) -> (B, N, 1)
+        output = self.head(mixed_embeddings)
         
         return output
-    
-    def predict_with_uncertainty(
-        self,
-        x: torch.Tensor,
-        asset_ids: Optional[torch.Tensor] = None,
-        n_iter: int = 10,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Monte Carlo inference for uncertainty quantification.
-        
-        Runs forward pass multiple times with dropout enabled to estimate
-        prediction uncertainty via variance across iterations.
-        
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input features of shape (Batch, N_Features).
-        asset_ids : torch.Tensor, optional
-            Asset IDs of shape (Batch,).
-        n_iter : int, optional
-            Number of Monte Carlo iterations (default: 10).
-            
-        Returns
-        -------
-        mean_probs : torch.Tensor
-            Mean predicted probabilities of shape (Batch, 1).
-        uncertainties : torch.Tensor
-            Standard deviation of predictions of shape (Batch, 1).
-        """
-        self.train()  # Enable dropout
-        predictions = []
-        
-        with torch.no_grad():
-            for _ in range(n_iter):
-                pred = self.forward(x, asset_ids)
-                predictions.append(pred)
-        
-        predictions = torch.stack(predictions, dim=0)  # (n_iter, Batch, 1)
-        mean_probs = predictions.mean(dim=0)  # (Batch, 1)
-        uncertainties = predictions.std(dim=0)  # (Batch, 1)
-        
-        self.eval()  # Restore eval mode
-        return mean_probs, uncertainties
 
 
 class TorchSklearnWrapper(BaseEstimator, ClassifierMixin):
     """
-    Sklearn-compatible wrapper for PyTorch models.
+    Sklearn-compatible wrapper for GraphVisionary.
     
-    Handles training loop, early stopping, device management, and provides
-    sklearn-compatible fit/predict_proba interface.
+    Handles reshaping of input data from (Samples, Features) to (Batch, Time, Assets, Features)
+    assuming the input X contains metadata or is structured in a specific way.
     
-    Parameters
-    ----------
-    n_features : int
-        Number of input features.
-    hidden_dim : int, optional
-        Hidden dimension for the neural network (default: 32).
-    sequence_length : int, optional
-        Sequence length for reshaping (default: 16).
-    lstm_hidden : int, optional
-        LSTM hidden size (default: 64).
-    dropout : float, optional
-        Dropout probability (default: 0.2).
-    learning_rate : float, optional
-        Learning rate for Adam optimizer (default: 0.001).
-    batch_size : int, optional
-        Training batch size (default: 64).
-    max_epochs : int, optional
-        Maximum training epochs (default: 100).
-    patience : int, optional
-        Early stopping patience (default: 10).
-    validation_split : float, optional
-        Fraction of data for validation (default: 0.15).
-    random_state : int, optional
-        Random seed (default: 42).
+    CRITICAL: This wrapper assumes that when `fit` is called, X is either:
+    1. A 4D numpy array (Batch, Time, Assets, Features) - Ideal
+    2. A 2D array that needs reshaping.
+    
+    For the QFC pipeline, `HybridTrendExpert` passes a 2D array.
+    However, with the Global Market upgrade, we need to change how data is passed.
+    
+    To maintain compatibility, we will assume X contains a special structure or we
+    will rely on the user to pass a 4D array if they want Global mode.
+    
+    Actually, the task says: "You must reshape the linear X input back into (Time, Assets, Features)..."
+    This implies X is flattened.
     """
     
     def __init__(
         self,
         n_features: int,
-        num_assets: int = 11,
-        embedding_dim: int = 16,
-        hidden_dim: int = 32,
+        n_assets: int = 11,
         sequence_length: int = 16,
-        lstm_hidden: int = 64,
+        hidden_dim: int = 64,
+        n_heads: int = 4,
         dropout: float = 0.2,
         learning_rate: float = 0.001,
-        batch_size: int = 64,
+        batch_size: int = 32,
         max_epochs: int = 100,
         patience: int = 10,
         validation_split: float = 0.15,
         random_state: int = 42,
     ):
         self.n_features = n_features
-        self.num_assets = num_assets
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = hidden_dim
+        self.n_assets = n_assets
         self.sequence_length = sequence_length
-        self.lstm_hidden = lstm_hidden
+        self.hidden_dim = hidden_dim
+        self.n_heads = n_heads
         self.dropout = dropout
         self.learning_rate = learning_rate
         self.batch_size = batch_size
@@ -291,175 +166,150 @@ class TorchSklearnWrapper(BaseEstimator, ClassifierMixin):
         self.validation_split = validation_split
         self.random_state = random_state
         
-        # Device management: Auto-detect GPU
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # Initialize model
         self.model_ = None
         self.classes_ = np.array([0, 1])
         
     def _initialize_model(self) -> None:
-        """Initialize the neural network model."""
-        self.model_ = AdaptiveConvExpert(
+        self.model_ = GraphVisionary(
             n_features=self.n_features,
-            num_assets=self.num_assets,
-            embedding_dim=self.embedding_dim,
+            n_assets=self.n_assets,
             hidden_dim=self.hidden_dim,
-            sequence_length=self.sequence_length,
-            lstm_hidden=self.lstm_hidden,
+            n_heads=self.n_heads,
             dropout=self.dropout,
         ).to(self.device)
         
-    def fit(self, X: np.ndarray, y: np.ndarray, asset_ids: Optional[np.ndarray] = None) -> "TorchSklearnWrapper":
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "TorchSklearnWrapper":
         """
-        Train the neural network with early stopping.
+        Fit the GraphVisionary model.
         
-        Parameters
-        ----------
-        X : np.ndarray
-            Training features of shape (n_samples, n_features).
-        y : np.ndarray
-            Training labels of shape (n_samples,).
-            
-        Returns
-        -------
-        self : TorchSklearnWrapper
-            Fitted estimator.
+        X is expected to be (N_Samples, Flattened_Features).
+        We assume N_Samples = Batch_Size * N_Assets.
+        We assume Flattened_Features = Sequence_Length * N_Features.
+        
+        We reshape X to (Batch_Size, Sequence_Length, N_Assets, N_Features).
         """
-        # Initialize model
         self._initialize_model()
         
-        # Handle asset_ids
-        if asset_ids is None:
-            asset_ids = np.zeros(len(X), dtype=np.int64)
+        # Check input shape
+        n_samples, input_dim = X.shape
         
-        # Train/validation split
-        X_train, X_val, y_train, y_val, asset_train, asset_val = train_test_split(
-            X, y, asset_ids,
-            test_size=self.validation_split,
-            random_state=self.random_state,
-            stratify=y,
-        )
+        if n_samples % self.n_assets != 0:
+            raise ValueError(f"Number of samples ({n_samples}) must be divisible by n_assets ({self.n_assets}) for global reshaping.")
+            
+        batch_size = n_samples // self.n_assets
         
-        # Convert to tensors
-        X_train_t = torch.FloatTensor(X_train).to(self.device)
-        y_train_t = torch.FloatTensor(y_train).unsqueeze(1).to(self.device)
-        asset_train_t = torch.LongTensor(asset_train).to(self.device)
-        X_val_t = torch.FloatTensor(X_val).to(self.device)
-        y_val_t = torch.FloatTensor(y_val).unsqueeze(1).to(self.device)
-        asset_val_t = torch.LongTensor(asset_val).to(self.device)
+        # Check feature dimension
+        # We expect input_dim to be sequence_length * n_features
+        # But self.n_features might have been initialized with input_dim in HybridTrendExpert if we are not careful.
+        # Let's assume self.n_features is the raw feature count.
         
-        # Optimizer and loss
+        # If input_dim != self.sequence_length * self.n_features:
+        #    # Try to infer n_features
+        #    if input_dim % self.sequence_length == 0:
+        #        self.n_features = input_dim // self.sequence_length
+        #        # Re-initialize model with correct n_features
+        #        self._initialize_model()
+        #    else:
+        #        raise ValueError(f"Input dim {input_dim} not divisible by sequence length {self.sequence_length}")
+
+        # Reshape: (Batch * Assets, Seq * F) -> (Batch, Assets, Seq, F)
+        # We assume the samples are ordered: Batch 0 Asset 0, Batch 0 Asset 1, ...
+        X_reshaped = X.reshape(batch_size, self.n_assets, self.sequence_length, self.n_features)
+        
+        # Permute to (Batch, Seq, Assets, F) for GraphVisionary
+        X_tensor = torch.FloatTensor(X_reshaped).permute(0, 2, 1, 3).to(self.device)
+        
+        # y is (Batch * Assets,) or (Batch * Assets, 1)
+        # We need to reshape y to (Batch, Assets) for loss calculation
+        if y.ndim == 1:
+            y = y.reshape(batch_size, self.n_assets)
+        elif y.ndim == 2 and y.shape[1] == 1:
+            y = y.reshape(batch_size, self.n_assets)
+            
+        y_tensor = torch.FloatTensor(y).to(self.device)
+        
+        # Train/Val split (on Batch dimension)
+        # We manually split the tensors to keep batches intact
+        val_size = int(batch_size * self.validation_split)
+        train_size = batch_size - val_size
+        
+        X_train = X_tensor[:train_size]
+        y_train = y_tensor[:train_size]
+        X_val = X_tensor[train_size:]
+        y_val = y_tensor[train_size:]
+        
         optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.learning_rate)
         criterion = nn.BCELoss()
         
-        # Training loop with early stopping
         best_val_loss = float('inf')
         patience_counter = 0
         
         for epoch in range(self.max_epochs):
             self.model_.train()
             
-            # Mini-batch training
-            n_samples = X_train_t.size(0)
-            indices = torch.randperm(n_samples)
+            # Mini-batching
+            n_train_batches = X_train.size(0)
+            indices = torch.randperm(n_train_batches)
             
             train_loss = 0.0
             n_batches = 0
             
-            for start_idx in range(0, n_samples, self.batch_size):
-                end_idx = min(start_idx + self.batch_size, n_samples)
+            for start_idx in range(0, n_train_batches, self.batch_size):
+                end_idx = min(start_idx + self.batch_size, n_train_batches)
                 batch_indices = indices[start_idx:end_idx]
                 
-                X_batch = X_train_t[batch_indices]
-                y_batch = y_train_t[batch_indices]
-                asset_batch = asset_train_t[batch_indices]
+                X_batch = X_train[batch_indices]
+                y_batch = y_train[batch_indices]
                 
-                # Forward pass
                 optimizer.zero_grad()
-                outputs = self.model_(X_batch, asset_batch)
-                loss = criterion(outputs, y_batch)
+                outputs = self.model_(X_batch) # (B, N, 1)
+                outputs = outputs.squeeze(-1)  # (B, N)
                 
-                # Backward pass
+                loss = criterion(outputs, y_batch)
                 loss.backward()
                 optimizer.step()
                 
                 train_loss += loss.item()
                 n_batches += 1
             
-            train_loss /= n_batches
+            train_loss /= max(1, n_batches)
             
             # Validation
             self.model_.eval()
             with torch.no_grad():
-                val_outputs = self.model_(X_val_t, asset_val_t)
-                val_loss = criterion(val_outputs, y_val_t).item()
-            
-            # Early stopping
+                val_outputs = self.model_(X_val).squeeze(-1)
+                val_loss = criterion(val_outputs, y_val).item()
+                
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
-                # Save best model state
                 self.best_state_dict_ = self.model_.state_dict().copy()
             else:
                 patience_counter += 1
                 
             if patience_counter >= self.patience:
-                # Restore best model
                 self.model_.load_state_dict(self.best_state_dict_)
                 break
-        
+                
         return self
-    
-    def predict_proba(self, X: np.ndarray, asset_ids: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        Predict class probabilities.
         
-        Parameters
-        ----------
-        X : np.ndarray
-            Features of shape (n_samples, n_features).
-        asset_ids : np.ndarray, optional
-            Asset IDs of shape (n_samples,).
-            
-        Returns
-        -------
-        np.ndarray
-            Probabilities of shape (n_samples, 2) for [class_0, class_1].
-        """
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
         if self.model_ is None:
             raise RuntimeError("Model must be fitted before predict_proba.")
+            
+        n_samples, input_dim = X.shape
+        batch_size = n_samples // self.n_assets
         
-        # Handle asset_ids
-        if asset_ids is None:
-            asset_ids = np.zeros(len(X), dtype=np.int64)
+        X_reshaped = X.reshape(batch_size, self.n_assets, self.sequence_length, self.n_features)
+        X_tensor = torch.FloatTensor(X_reshaped).permute(0, 2, 1, 3).to(self.device)
         
         self.model_.eval()
         with torch.no_grad():
-            X_t = torch.FloatTensor(X).to(self.device)
-            asset_t = torch.LongTensor(asset_ids).to(self.device)
-            probs_class_1 = self.model_(X_t, asset_t).cpu().numpy()
-        
-        # Return probabilities for both classes
-        probs_class_0 = 1.0 - probs_class_1
-        return np.hstack([probs_class_0, probs_class_1])
-    
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """
-        Predict class labels.
-        
-        Parameters
-        ----------
-        X : np.ndarray
-            Features of shape (n_samples, n_features).
+            probs = self.model_(X_tensor).cpu().numpy() # (B, N, 1)
             
-        Returns
-        -------
-        np.ndarray
-            Predicted labels of shape (n_samples,).
-        """
-        probs = self.predict_proba(X)
-        return (probs[:, 1] > 0.5).astype(int)
+        # Flatten back to (B * N, 1)
+        probs_flat = probs.reshape(-1, 1)
+        return np.hstack([1.0 - probs_flat, probs_flat])
 
-
-__all__ = ["AdaptiveConvExpert", "TorchSklearnWrapper"]
+__all__ = ["GraphVisionary", "TorchSklearnWrapper"]

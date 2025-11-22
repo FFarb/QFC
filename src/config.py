@@ -50,6 +50,7 @@ PRIMARY_RECALL_TARGET = 0.7
 
 # --- Neural Architecture (Sparse-Activated System) ---------------------------
 NUM_ASSETS = len(SYMBOLS)  # Number of assets for embedding layer
+N_ASSETS = NUM_ASSETS      # Alias for consistency with new code
 EMBEDDING_DIM = 16         # Dimension of asset embeddings
 DROPOUT_RATE = 0.2         # Sparse activation dropout rate
 MC_ITERATIONS = 10         # Monte Carlo inference iterations for uncertainty

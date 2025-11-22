@@ -9,9 +9,12 @@ import time
 import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Union
 
 import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pybit.unified_trading import HTTP
@@ -25,6 +28,133 @@ from .config import (
     PLOT_TEMPLATE,
     SYMBOLS,
 )
+
+
+class GlobalMarketDataset(Dataset):
+    """
+    Dataset that provides a synchronized global view of the market.
+    
+    Structure:
+    - Loads multiple asset parquet files.
+    - Aligns them on timestamp intersection (strict alignment).
+    - Yields windows of shape (Sequence_Length, N_Assets, N_Features).
+    """
+    
+    def __init__(
+        self,
+        file_paths: List[Union[str, Path]],
+        sequence_length: int = 16,
+        features: Optional[List[str]] = None,
+    ):
+        self.sequence_length = sequence_length
+        self.features = features
+        
+        # Load and align data
+        self.data, self.timestamps = self._load_and_align(file_paths)
+        
+        # Convert to tensor: (Time, N_Assets, N_Features)
+        self.data_tensor = torch.FloatTensor(self.data)
+        
+    def _load_and_align(self, file_paths: List[Union[str, Path]]) -> tuple[np.ndarray, pd.DatetimeIndex]:
+        dfs = []
+        common_index = None
+        
+        print(f"[GLOBAL_LOADER] Loading {len(file_paths)} assets...")
+        
+        for path in file_paths:
+            df = pd.read_parquet(path)
+            
+            # Ensure index is datetime
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                df = df.set_index("timestamp")
+            else:
+                df.index = pd.to_datetime(df.index)
+            
+            # Select features if specified
+            if self.features:
+                available_features = [f for f in self.features if f in df.columns]
+                if len(available_features) < len(self.features):
+                     # If missing features, we might need to handle it. For now, strict.
+                     pass
+                df = df[self.features]
+            else:
+                # Default to numeric columns if not specified
+                df = df.select_dtypes(include=[np.number])
+            
+            dfs.append(df.sort_index())
+            
+            if common_index is None:
+                common_index = df.index
+            else:
+                common_index = common_index.intersection(df.index)
+        
+        if common_index is None or len(common_index) == 0:
+            raise ValueError("No overlapping timestamps found across assets!")
+            
+        print(f"[GLOBAL_LOADER] Aligned on {len(common_index)} timestamps.")
+        
+        # Reindex all dfs to common index and stack
+        aligned_data = []
+        for df in dfs:
+            aligned_data.append(df.loc[common_index].values)
+            
+        # Stack to (Time, N_Assets, N_Features)
+        # aligned_data is list of (Time, Features) arrays
+        # We want (Time, Assets, Features)
+        stacked = np.stack(aligned_data, axis=1)
+        
+        return stacked, common_index
+
+    def __len__(self):
+        return len(self.data_tensor) - self.sequence_length + 1
+
+    def __getitem__(self, idx):
+        # Return window: (Sequence_Length, N_Assets, N_Features)
+        return self.data_tensor[idx : idx + self.sequence_length]
+
+
+def make_global_loader(
+    data_dir: Union[str, Path],
+    batch_size: int = 32,
+    sequence_length: int = 16,
+    features: Optional[List[str]] = None,
+    shuffle: bool = True,
+) -> DataLoader:
+    """
+    Creates a DataLoader for the GlobalMarketDataset.
+    
+    Parameters
+    ----------
+    data_dir : str | Path
+        Directory containing processed parquet files for each asset.
+    batch_size : int
+        Batch size.
+    sequence_length : int
+        Window size.
+    features : List[str], optional
+        List of feature columns to include.
+    shuffle : bool
+        Whether to shuffle the batches.
+        
+    Returns
+    -------
+    DataLoader
+    """
+    data_dir = Path(data_dir)
+    # Assume all parquet files in dir are assets
+    file_paths = sorted(list(data_dir.glob("*.parquet")))
+    
+    if not file_paths:
+        raise ValueError(f"No parquet files found in {data_dir}")
+        
+    dataset = GlobalMarketDataset(
+        file_paths=file_paths,
+        sequence_length=sequence_length,
+        features=features
+    )
+    
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
 class MarketDataLoader:

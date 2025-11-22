@@ -17,6 +17,7 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 
 from .deep_experts import TorchSklearnWrapper
+from ..config import NUM_ASSETS
 
 
 def _as_dataframe(X: pd.DataFrame | np.ndarray | Sequence[Sequence[float]]) -> pd.DataFrame:
@@ -80,20 +81,47 @@ class HybridTrendExpert(BaseEstimator, ClassifierMixin):
         y_array = np.ravel(np.asarray(y))
         X_scaled = self.scaler_.fit_transform(X_array)
         
-        # Init Visionary
+        # Init Visionary with Global Context
         if self.visionary is None:
-            self.visionary = TorchSklearnWrapper(n_features=X_scaled.shape[1], random_state=self.random_state)
+            # We assume X_scaled is (Batch * Assets, Sequence_Length * Features)
+            # We need to derive n_features per asset.
+            seq_len = 16 
+            
+            total_features = X_scaled.shape[1]
+            if total_features % seq_len != 0:
+                 # Fallback
+                 n_features = total_features
+            else:
+                 n_features = total_features // seq_len
+            
+            self.visionary = TorchSklearnWrapper(
+                n_features=n_features,
+                n_assets=NUM_ASSETS,
+                sequence_length=seq_len,
+                random_state=self.random_state
+            )
         
-        # Train Analyst (Supports weights)
+        # Train Analyst (Supports weights) - Analyst sees each row independently
         self.analyst.fit(X_scaled, y_array, sample_weight=sample_weight)
         
-        # Train Visionary (Does not support weights yet, ignoring)
+        # Train Visionary (Neural Part) - Needs Global Context
+        # We pass X_scaled directly. TorchSklearnWrapper.fit will handle reshaping if possible.
+        # If X_scaled is just a pile of rows, reshaping might be wrong if order isn't preserved.
+        # We assume the caller (run_deep_research.py) provides data in correct order:
+        # Time-major or Asset-major blocks.
+        # Given GlobalMarketDataset yields (Time, Assets, Features), if we flatten it,
+        # it becomes (Time * Assets, Features).
+        # TorchSklearnWrapper needs to reconstruct (Time, Assets, Features).
+        # It needs to know Sequence_Length.
+        
         self.visionary.fit(X_scaled, y_array)
         
         # Train Meta (Supports weights)
-        # For simplicity in this patch, we skip stacking complexity and train meta on base predictions
         p1 = self.analyst.predict_proba(X_scaled)[:, 1]
+        
+        # Visionary predict_proba returns (Samples, 2)
         p2 = self.visionary.predict_proba(X_scaled)[:, 1]
+        
         meta_X = np.column_stack([p1, p2])
         self.meta_learner.fit(meta_X, y_array, sample_weight=sample_weight)
         
