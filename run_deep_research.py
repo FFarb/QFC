@@ -258,10 +258,11 @@ def run_pipeline() -> None:
     artifacts.mkdir(exist_ok=True)
     
     val_df = pd.DataFrame({"probability": probs, "target": y_test.values})
-    val_df.to_parquet(artifacts / "money_machine_snapshot.parquet")
+    val_path = artifacts / "money_machine_snapshot.parquet"
+    val_df.to_parquet(val_path)
     print(f"    Snapshot saved.")
     
-    run_tuning()
+    run_tuning(validation_path=val_path, output_dir=artifacts)
     cleanup_temp_dir()
 
 if __name__ == "__main__":
