@@ -218,19 +218,23 @@ class TorchSklearnWrapper(BaseEstimator, ClassifierMixin):
             
             # We need to create windows of sequence_length
             # If input_dim matches sequence_length * n_features, we can reshape
+            # We need to create windows of sequence_length
+            # If input_dim matches sequence_length * n_features, we can reshape
             if input_dim % self.sequence_length == 0:
                 inferred_features = input_dim // self.sequence_length
+                actual_seq_len = self.sequence_length
             else:
                 # Fallback: treat entire input as features for a single timestep
                 # This won't work well with GraphVisionary but prevents crash
                 inferred_features = input_dim
+                actual_seq_len = 1
                 
             # Create sliding windows or just use samples as-is
             # For simplicity, we'll treat each sample as a single timestep with n_assets=1
             # Reshape: (N_Samples, Seq * F) -> (N_Samples, Seq, 1, F)
             
             batch_size = n_samples
-            X_reshaped = X.reshape(batch_size, self.sequence_length, 1, inferred_features)
+            X_reshaped = X.reshape(batch_size, actual_seq_len, 1, inferred_features)
             X_tensor = torch.FloatTensor(X_reshaped).to(self.device)
             
             # y stays as (N_Samples,) -> reshape to (N_Samples, 1)
@@ -327,13 +331,16 @@ class TorchSklearnWrapper(BaseEstimator, ClassifierMixin):
             X_tensor = torch.FloatTensor(X_reshaped).permute(0, 2, 1, 3).to(self.device)
         else:
             # Legacy mode
+            # Legacy mode
             if input_dim % self.sequence_length == 0:
                 inferred_features = input_dim // self.sequence_length
+                actual_seq_len = self.sequence_length
             else:
                 inferred_features = input_dim
+                actual_seq_len = 1
                 
             batch_size = n_samples
-            X_reshaped = X.reshape(batch_size, self.sequence_length, 1, inferred_features)
+            X_reshaped = X.reshape(batch_size, actual_seq_len, 1, inferred_features)
             X_tensor = torch.FloatTensor(X_reshaped).to(self.device)
         
         self.model_.eval()
